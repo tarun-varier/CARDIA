@@ -1,19 +1,13 @@
-#include <iostream>
-#include <vector>
-#include <string>
-#include <fstream>
-#include <sstream>
-#include <chrono>
-#include <cmath>
-#include <numeric>
-#include <iomanip>
-#include <algorithm>
-#include <omp.h>
+// ecg_parallel_fixed.cpp
+// Chunked parallel Pan-Tompkins-style pipeline with corrected boundary handling.
+// Compile: g++ -O3 -fopenmp ecg_parallel_fixed.cpp -o ecg_parallel_fixed
 
+#include <bits/stdc++.h>
+#include <omp.h>
 using namespace std;
 using hrc_t = chrono::high_resolution_clock;
 
-// ---------- 1. Optimized CSV loader ----------
+// ---------------- CSV loader ----------------
 vector<double> load_csv_ecg(const string& filename) {
     ifstream fin(filename);
     if (!fin.is_open()) {
@@ -21,40 +15,34 @@ vector<double> load_csv_ecg(const string& filename) {
         exit(1);
     }
     vector<double> x;
-    x.reserve(2000000); 
+    x.reserve(2000000);
     string line;
     while (getline(fin, line)) {
         if (line.empty()) continue;
         char* pEnd;
         double val = strtod(line.c_str(), &pEnd);
-        if (pEnd != line.c_str()) { // Check if a conversion happened
-            x.push_back(val);
-        }
+        if (pEnd != line.c_str()) x.push_back(val);
     }
-    cout << "Loaded " << x.size() << " samples from " << filename << "\n";
     return x;
 }
 
-// ---------- ECG pipeline ----------
+// ---------------- simple bandpass (global) ----------------
+// Note: kept identical to earlier simple_bandpass for comparability
 vector<double> simple_bandpass(const vector<double>& x, int fs) {
-    int N = x.size();
+    int N = (int)x.size();
     vector<double> y(N, 0.0);
-    int hp_win = max(1, int(0.6 * fs));
+    int hp_win = max(1, int(0.6 * fs));        // highpass moving-average window
     vector<double> ma(N, 0.0);
     double sum = 0.0;
-
     for (int i = 0; i < N; ++i) {
         sum += x[i];
         if (i >= hp_win) sum -= x[i - hp_win];
         ma[i] = sum / min(i + 1, hp_win);
     }
-
-    // Highpass
-    #pragma omp parallel for
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < N; ++i) y[i] = x[i] - ma[i];
 
-    // Lowpass (also sequential)
-    int lp_win = max(1, int(0.12 * fs));
+    int lp_win = max(1, int(0.12 * fs));       // lowpass moving-average window
     vector<double> out(N, 0.0);
     sum = 0.0;
     for (int i = 0; i < N; ++i) {
@@ -65,41 +53,38 @@ vector<double> simple_bandpass(const vector<double>& x, int fs) {
     return out;
 }
 
-
-// Sequential moving window integral
+// ---------------- moving window integration ----------------
 vector<double> moving_window_integral(const vector<double>& x, int window_samples) {
-    int N = x.size();
+    int N = (int)x.size();
     vector<double> out(N, 0.0);
     double sum = 0.0;
     for (int i = 0; i < N; ++i) {
         sum += x[i];
         if (i >= window_samples) sum -= x[i - window_samples];
-        if (window_samples > 0) {
-            out[i] = sum / (double)window_samples;
-        }
+        if (window_samples > 0) out[i] = sum / (double)window_samples;
     }
     return out;
 }
 
-// ---------- Parallelized stats ----------
-vector<int> detect_peaks(const vector<double>& raw, const vector<double>& integ, int fs) {
-    int N = raw.size();
+// ---------------- detect peaks (per-chunk) ----------------
+// Note: this operates on filtered (for peak amplitude selection) and integ (for thresholding)
+vector<int> detect_peaks_local(const vector<double>& filtered, const vector<double>& integ, int fs) {
+    int N = (int)filtered.size();
     vector<int> peaks;
 
+    // Robust mean/std (parallel reductions)
     double mean = 0.0;
     #pragma omp parallel for reduction(+:mean)
-    for (int i = 0; i < N; ++i)
-        mean += integ[i];
-    mean /= N;
+    for (int i = 0; i < N; ++i) mean += integ[i];
+    mean /= max(1, N);
 
     double var = 0.0;
     #pragma omp parallel for reduction(+:var)
-    for (int i = 0; i < N; ++i)
-        var += (integ[i] - mean) * (integ[i] - mean);
-    double sigma = sqrt(var / N);
+    for (int i = 0; i < N; ++i) var += (integ[i] - mean) * (integ[i] - mean);
+    double sigma = sqrt(var / max(1, N));
 
     double threshold = mean + 1.5 * sigma;
-    int refractory = int(0.2 * fs);
+    int refractory = max(1, int(0.2 * fs)); // samples
 
     for (int i = 1; i < N - 1; ++i) {
         if (integ[i] > threshold && integ[i] > integ[i - 1] && integ[i] >= integ[i + 1]) {
@@ -107,12 +92,13 @@ vector<int> detect_peaks(const vector<double>& raw, const vector<double>& integ,
             int lo = max(0, i - win);
             int hi = min(N - 1, i + win);
             int peak_idx = lo;
-            double peak_val = raw[lo];
-            for (int j = lo + 1; j <= hi; ++j)
-                if (raw[j] > peak_val) {
-                    peak_val = raw[j];
+            double peak_val = filtered[lo];
+            for (int j = lo + 1; j <= hi; ++j) {
+                if (filtered[j] > peak_val) {
+                    peak_val = filtered[j];
                     peak_idx = j;
                 }
+            }
             if (peaks.empty() || peak_idx - peaks.back() > refractory)
                 peaks.push_back(peak_idx);
         }
@@ -120,78 +106,182 @@ vector<int> detect_peaks(const vector<double>& raw, const vector<double>& integ,
     return peaks;
 }
 
-// ---------- 2. Main computation with fused loops ----------
-void compute_and_print_results(const vector<double>& signal, int fs) {
-    int N = signal.size();
+// ---------------- chunk process ----------------
+struct ChunkResult {
+    int chunk_index;
+    int start_global;            // start index in full filtered array that corresponds to chunk[0]
+    vector<int> peaks_global;    // peak indices in global coordinates
+    double elapsed_ms;
+};
+
+ChunkResult process_chunk_task(const vector<double>& filtered_full,
+                               int fs,
+                               int actual_start,
+                               int actual_end,
+                               int chunk_index,
+                               int mwin_samples) {
     auto t0 = hrc_t::now();
 
-    auto filtered = simple_bandpass(signal, fs);
-    
+    // slice filtered_full [actual_start, actual_end)
+    int N = actual_end - actual_start;
+    vector<double> filtered_chunk(N);
+    for (int i = 0; i < N; ++i) filtered_chunk[i] = filtered_full[actual_start + i];
+
+    // derivative + square (fused)
     vector<double> squared(N, 0.0);
     #pragma omp parallel for schedule(static)
     for (int i = 1; i < N; ++i) {
-        double d = filtered[i] - filtered[i - 1];
+        double d = filtered_chunk[i] - filtered_chunk[i - 1];
         squared[i] = d * d;
     }
+    // moving-window integration
+    vector<double> integ = moving_window_integral(squared, mwin_samples);
 
-    int mwin_samples = max(1, int(0.15 * fs));
-    auto integ = moving_window_integral(squared, mwin_samples);
-    auto peaks = detect_peaks(filtered, integ, fs);
+    // local peak detection (indices relative to chunk)
+    vector<int> peaks_local = detect_peaks_local(filtered_chunk, integ, fs);
+
+    // convert to global indices
+    vector<int> peaks_global;
+    peaks_global.reserve(peaks_local.size());
+    for (int p : peaks_local) peaks_global.push_back(p + actual_start);
 
     auto t1 = hrc_t::now();
     double elapsed_ms = chrono::duration<double, milli>(t1 - t0).count();
 
-    vector<double> rr;
-    if (peaks.size() > 1) {
-        rr.resize(peaks.size() - 1);
-        #pragma omp parallel for schedule(static)
-        for (size_t i = 1; i < peaks.size(); ++i)
-            rr[i - 1] = (peaks[i] - peaks[i - 1]) / double(fs);
-    }
-    
-    double avg_bpm = 0.0;
-    if (!rr.empty()) {
-        double mean_rr = accumulate(rr.begin(), rr.end(), 0.0) / rr.size();
-        avg_bpm = 60.0 / mean_rr;
-    }
-
-    cout << "Samples: " << N
-         << ", Beats: " << peaks.size()
-         << ", Avg BPM: " << fixed << setprecision(2) << avg_bpm
-         << ", Time: " << fixed << setprecision(3) << elapsed_ms << " ms\n";
-    cout << "R-peaks (first 10):";
-    for (size_t i = 0; i < peaks.size() && i < 10; ++i)
-        cout << " " << peaks[i];
-    cout << "\n\n";
+    return {chunk_index, actual_start, peaks_global, elapsed_ms};
 }
 
+// ---------------- merge peaks (deterministic) ----------------
+vector<int> merge_and_resolve_peaks(const vector<int>& all_peaks_sorted,
+                                    const vector<double>& filtered_full,
+                                    int fs) {
+    if (all_peaks_sorted.empty()) return {};
 
-// ---------- main ----------
+    int refractory = max(1, int(0.2 * fs));
+    vector<int> final_peaks;
+    final_peaks.reserve(all_peaks_sorted.size());
+
+    for (int p : all_peaks_sorted) {
+        if (final_peaks.empty()) {
+            final_peaks.push_back(p);
+            continue;
+        }
+        int last = final_peaks.back();
+        if (p - last > refractory) {
+            final_peaks.push_back(p);
+        } else {
+            // too close: keep the one with larger filtered amplitude
+            if (filtered_full[p] > filtered_full[last]) {
+                final_peaks.back() = p;
+            }
+        }
+    }
+    return final_peaks;
+}
+
+// ---------------- main ----------------
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         cerr << "Usage: " << argv[0] << " <path_to_ecg_csv>\n";
-        cerr << "Example: ./ecg_realdata C:/Users/SAHEER/OneDrive/Desktop/college/ecg100.csv\n";
         return 1;
     }
     string filepath = argv[1];
-
     int fs = 360;
 
-    auto ecg_full = load_csv_ecg(filepath);
-    int N = ecg_full.size();
-    cout << "Total loaded samples: " << N << "\n\n";
-
-    vector<int> test_sizes = {6500, 65000, N};
-
-    for (int size : test_sizes) {
-        if (size > N) {
-            cout << "Skipping size " << size << " (exceeds dataset length)\n";
-            continue;
-        }
-        cout << "=== Running for first " << size << " samples ===\n";
-        vector<double> ecg_sub(ecg_full.begin(), ecg_full.begin() + size);
-        compute_and_print_results(ecg_sub, fs);
+    auto ecg = load_csv_ecg(filepath);
+    int N = (int)ecg.size();
+    if (N == 0) {
+        cerr << "No samples loaded.\n";
+        return 1;
     }
+
+    cout << "Loaded " << N << " samples from " << filepath << "\n";
+
+    // Pre-filter entire signal (serial) to match serial-run filter state
+    auto tfilter0 = hrc_t::now();
+    vector<double> filtered_full = simple_bandpass(ecg, fs);
+    auto tfilter1 = hrc_t::now();
+    double filter_time_ms = chrono::duration<double, milli>(tfilter1 - tfilter0).count();
+    cout << "Bandpass (global) done in " << fixed << setprecision(2) << filter_time_ms << " ms\n";
+
+    // moving window size for integration (used to choose padding)
+    int mwin_samples = max(1, int(0.15 * fs));   // same as used in previous code
+
+    // chunking parameters
+    int chunk_seconds = 5;
+    int chunk_samples = chunk_seconds * fs;
+    // overlap — choose >= mwin_samples; also keep at least ~0.5s to be safe
+    int min_overlap = max(mwin_samples, int(0.5 * fs));
+    int overlap = min_overlap;
+    int step = max(1, chunk_samples - overlap);
+    int num_chunks = (N + step - 1) / step;
+
+    cout << "Chunk size: " << chunk_samples << " samples, overlap: " << overlap
+         << " samples, step: " << step << ", num_chunks: " << num_chunks << "\n";
+
+    vector<ChunkResult> chunk_results(num_chunks);
+
+    auto T0 = hrc_t::now();
+
+    // Create tasks — each task will include padding of mwin_samples before and after
+    #pragma omp parallel
+    {
+        #pragma omp single
+        {
+            for (int c = 0; c < num_chunks; ++c) {
+                int nominal_start = c * step;
+                int nominal_end = min(N, nominal_start + chunk_samples);
+
+                // include padding on both sides equal to mwin_samples to ensure integration / derivative correctness
+                int actual_start = max(0, nominal_start - mwin_samples);
+                int actual_end = min(N, nominal_end + mwin_samples);
+
+                // launch a task
+                #pragma omp task firstprivate(c, actual_start, actual_end)
+                {
+                    chunk_results[c] = process_chunk_task(filtered_full, fs, actual_start, actual_end, c, mwin_samples);
+                }
+            }
+        }
+    } // implicit barrier to wait for tasks
+
+    auto T1 = hrc_t::now();
+    double total_proc_time_ms = chrono::duration<double, milli>(T1 - T0).count();
+
+    // collect all peaks from chunks
+    vector<int> all_peaks;
+    for (const auto& cr : chunk_results) {
+        for (int p : cr.peaks_global) all_peaks.push_back(p);
+    }
+
+    // sort and unique candidate peaks
+    sort(all_peaks.begin(), all_peaks.end());
+    // keep duplicates (we will resolve by amplitude/refractory) — but remove exact duplicates
+    all_peaks.erase(unique(all_peaks.begin(), all_peaks.end()), all_peaks.end());
+
+    // Resolve peaks that are too close (use filtered amplitude to prefer larger)
+    vector<int> final_peaks = merge_and_resolve_peaks(all_peaks, filtered_full, fs);
+
+    // compute BPM from final peaks
+    double avg_bpm = 0.0;
+    if (final_peaks.size() > 1) {
+        vector<double> rr(final_peaks.size() - 1);
+        for (size_t i = 1; i < final_peaks.size(); ++i)
+            rr[i - 1] = (final_peaks[i] - final_peaks[i - 1]) / double(fs);
+        double mean_rr = accumulate(rr.begin(), rr.end(), 0.0) / rr.size();
+        if (mean_rr > 0.0) avg_bpm = 60.0 / mean_rr;
+    }
+
+    cout << "\n--- RESULTS ---\n";
+    cout << "Total samples: " << N << "\n";
+    cout << "Detected peaks (after merge): " << final_peaks.size() << "\n";
+    cout << "Avg BPM: " << fixed << setprecision(2) << avg_bpm << "\n";
+    cout << "Filtering time (global): " << fixed << setprecision(2) << filter_time_ms << " ms\n";
+    cout << "Chunked processing time (parallel tasks total): " << fixed << setprecision(2) << total_proc_time_ms << " ms\n";
+
+    cout << "First 10 peaks: ";
+    for (size_t i = 0; i < final_peaks.size() && i < 10; ++i) cout << final_peaks[i] << " ";
+    cout << "\n";
 
     return 0;
 }
