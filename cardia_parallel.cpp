@@ -1,7 +1,3 @@
-// ecg_parallel_fixed.cpp
-// Chunked parallel Pan-Tompkins-style pipeline with corrected boundary handling.
-// Compile: g++ -O3 -fopenmp ecg_parallel_fixed.cpp -o ecg_parallel_fixed
-
 #include <bits/stdc++.h>
 #include <omp.h>
 using namespace std;
