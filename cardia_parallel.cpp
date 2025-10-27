@@ -21,13 +21,10 @@ vector<double> load_csv_ecg(const string& filename) {
         exit(1);
     }
     vector<double> x;
-    // Optimization: Reserve memory to avoid reallocations.
-    // A reasonable starting size, e.g., 2 million samples for a typical long recording.
     x.reserve(2000000); 
     string line;
     while (getline(fin, line)) {
         if (line.empty()) continue;
-        // Optimization: Use strtod to avoid stringstream and exception overhead.
         char* pEnd;
         double val = strtod(line.c_str(), &pEnd);
         if (pEnd != line.c_str()) { // Check if a conversion happened
@@ -39,9 +36,6 @@ vector<double> load_csv_ecg(const string& filename) {
 }
 
 // ---------- ECG pipeline (Serial Bottleneck, already efficient) ----------
-// This function contains loop-carried dependencies (the 'sum' variable),
-// making it inherently sequential. The current O(N) sliding window
-// implementation is already optimal for a single thread.
 vector<double> simple_bandpass(const vector<double>& x, int fs) {
     int N = x.size();
     vector<double> y(N, 0.0);
@@ -56,7 +50,6 @@ vector<double> simple_bandpass(const vector<double>& x, int fs) {
     }
 
     // Highpass
-    // This loop can be parallelized as it's element-wise.
     #pragma omp parallel for
     for (int i = 0; i < N; ++i) y[i] = x[i] - ma[i];
 
@@ -94,7 +87,6 @@ vector<int> detect_peaks(const vector<double>& raw, const vector<double>& integ,
     int N = raw.size();
     vector<int> peaks;
 
-    // Mean and variance are already efficiently parallelized with reduction
     double mean = 0.0;
     #pragma omp parallel for reduction(+:mean)
     for (int i = 0; i < N; ++i)
@@ -110,9 +102,6 @@ vector<int> detect_peaks(const vector<double>& raw, const vector<double>& integ,
     double threshold = mean + 1.5 * sigma;
     int refractory = int(0.2 * fs);
 
-    // This peak-picking loop is stateful and sequential due to the
-    // dependency on the previously found peak (`peaks.back()`).
-    // It's best left sequential.
     for (int i = 1; i < N - 1; ++i) {
         if (integ[i] > threshold && integ[i] > integ[i - 1] && integ[i] >= integ[i + 1]) {
             int win = max(1, int(0.04 * fs));
@@ -139,9 +128,6 @@ void compute_and_print_results(const vector<double>& signal, int fs) {
 
     auto filtered = simple_bandpass(signal, fs);
     
-    // Optimization: Fuse the derivative and square operations into a single loop.
-    // This eliminates an entire intermediate vector ('deriv') and reduces
-    // memory traffic and parallel region overhead.
     vector<double> squared(N, 0.0);
     #pragma omp parallel for schedule(static)
     for (int i = 1; i < N; ++i) {
@@ -156,7 +142,6 @@ void compute_and_print_results(const vector<double>& signal, int fs) {
     auto t1 = hrc_t::now();
     double elapsed_ms = chrono::duration<double, milli>(t1 - t0).count();
 
-    // RR intervals and BPM (already parallel)
     vector<double> rr;
     if (peaks.size() > 1) {
         rr.resize(peaks.size() - 1);
@@ -167,8 +152,6 @@ void compute_and_print_results(const vector<double>& signal, int fs) {
     
     double avg_bpm = 0.0;
     if (!rr.empty()) {
-        // Using a parallel reduction for the final sum is possible but likely
-        // overkill unless the number of peaks is massive. accumulate is fine.
         double mean_rr = accumulate(rr.begin(), rr.end(), 0.0) / rr.size();
         avg_bpm = 60.0 / mean_rr;
     }
@@ -193,18 +176,14 @@ int main(int argc, char* argv[]) {
     }
     string filepath = argv[1];
 
-    // MIT-BIH sampling rate
     int fs = 360;
 
-    // --- Load full dataset ---
     auto ecg_full = load_csv_ecg(filepath);
     int N = ecg_full.size();
     cout << "Total loaded samples: " << N << "\n\n";
 
-    // --- Define test sizes ---
     vector<int> test_sizes = {6500, 65000, N};
 
-    // --- Run for each subset ---
     for (int size : test_sizes) {
         if (size > N) {
             cout << "Skipping size " << size << " (exceeds dataset length)\n";
