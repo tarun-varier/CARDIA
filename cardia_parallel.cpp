@@ -35,7 +35,7 @@ vector<double> load_csv_ecg(const string& filename) {
     return x;
 }
 
-// ---------- ECG pipeline (Serial Bottleneck, already efficient) ----------
+// ---------- ECG pipeline ----------
 vector<double> simple_bandpass(const vector<double>& x, int fs) {
     int N = x.size();
     vector<double> y(N, 0.0);
@@ -66,7 +66,7 @@ vector<double> simple_bandpass(const vector<double>& x, int fs) {
 }
 
 
-// Sequential moving window integral (same principle as bandpass)
+// Sequential moving window integral
 vector<double> moving_window_integral(const vector<double>& x, int window_samples) {
     int N = x.size();
     vector<double> out(N, 0.0);
@@ -74,7 +74,6 @@ vector<double> moving_window_integral(const vector<double>& x, int window_sample
     for (int i = 0; i < N; ++i) {
         sum += x[i];
         if (i >= window_samples) sum -= x[i - window_samples];
-        // Avoid division by zero if window_samples is 0
         if (window_samples > 0) {
             out[i] = sum / (double)window_samples;
         }
@@ -82,7 +81,7 @@ vector<double> moving_window_integral(const vector<double>& x, int window_sample
     return out;
 }
 
-// ---------- Parallelized stats (no major changes needed) ----------
+// ---------- Parallelized stats ----------
 vector<int> detect_peaks(const vector<double>& raw, const vector<double>& integ, int fs) {
     int N = raw.size();
     vector<int> peaks;
